@@ -94,34 +94,6 @@ def utf8_sort(values):
     return sorted(values, key=lambda x: x.encode("utf-8"))
 
 
-def valid_optional_shape(shape, numel):
-    """
-    Shape is optional because the API's original parameter schema only
-    requires name/target/numel.
-
-    If shape is supplied, however, it must be a non-empty list of positive
-    safe integers whose product exactly equals numel.
-    """
-    if shape is None:
-        return True
-
-    if (
-        not isinstance(shape, list)
-        or len(shape) == 0
-        or not all(positive_safe_int(dim) for dim in shape)
-    ):
-        return False
-
-    product = 1
-
-    for dim in shape:
-        if product > MAX_SAFE_INT // dim:
-            return False
-        product *= dim
-
-    return product == numel
-
-
 def choose(payload):
     total_costs = {name: None for name in INTERVENTIONS}
     reasons = {name: [] for name in INTERVENTIONS}
@@ -313,7 +285,7 @@ def repair(payload):
     if not template_pass:
         reason.add("CHAT_TEMPLATE_COUNT")
 
-    # ---------------- Parameters / LoRA targets ----------------
+    # ---------------- Parameters ----------------
 
     parameters = payload.get("parameters")
     allowed = payload.get("allowedTargets")
@@ -323,7 +295,7 @@ def repair(payload):
     allowed_valid = (
         isinstance(allowed, list)
         and len(allowed) > 0
-        and all(isinstance(x, str) and x != "" for x in allowed)
+        and all(isinstance(x, str) and x for x in allowed)
         and len(set(allowed)) == len(allowed)
     )
 
@@ -357,13 +329,6 @@ def repair(payload):
                 parameters_valid = False
                 break
 
-            # Shape is optional for backwards compatibility with the API
-            # schema. If present, it must be mathematically consistent with
-            # numel.
-            if not valid_optional_shape(p.get("shape"), numel):
-                parameters_valid = False
-                break
-
     selected = []
 
     if parameters_valid and allowed_valid:
@@ -373,15 +338,12 @@ def repair(payload):
             name = p["name"]
             target = p["target"]
 
-            # Non-LoRA parameters are allowed in the parameter list but are
-            # not trainable. Only LoRA A/B weights on an allowed target count.
-            if (
-                target in allowed_set
-                and (
-                    name.endswith(".lora_A.weight")
-                    or name.endswith(".lora_B.weight")
-                )
-            ):
+            is_lora = (
+                name.endswith(".lora_A.weight")
+                or name.endswith(".lora_B.weight")
+            )
+
+            if is_lora and target in allowed_set:
                 selected.append(p)
 
         if not selected:
@@ -399,18 +361,16 @@ def repair(payload):
             key=lambda x: x.encode("utf-8"),
         )
 
-        # Explicit safe accumulation instead of relying on an unbounded
-        # Python sum.
         trainable_count = 0
 
         for p in selected:
-            numel = p["numel"]
+            n = p["numel"]
 
-            if trainable_count > MAX_SAFE_INT - numel:
+            if trainable_count > MAX_SAFE_INT - n:
                 parameters_valid = False
                 break
 
-            trainable_count += numel
+            trainable_count += n
 
         if not parameters_valid:
             reason.add("INVALID_PARAMETER")
@@ -429,18 +389,11 @@ def repair(payload):
 
     files = payload.get("artifactFiles")
 
-    # Exact adapter artifact set.
-    #
-    # The two expected files are:
-    #   adapter_config.json
-    #   adapter_model.safetensors
-    #
-    # Duplicates, missing files, and extra files all fail this check.
     adapter_valid = (
         isinstance(files, list)
-        and len(files) == len(ADAPTER_FILES)
+        and len(files) == 2
         and all(isinstance(x, str) for x in files)
-        and len(set(files)) == len(files)
+        and len(set(files)) == 2
         and set(files) == ADAPTER_FILES
     )
 
@@ -453,8 +406,6 @@ def repair(payload):
         adapter_files = []
         reason.add("ADAPTER_FILE_SET")
 
-    # An explicit extra artifact indicates that a full-model artifact was
-    # supplied alongside/under the adapter artifact list.
     if isinstance(files, list):
         for f in files:
             if isinstance(f, str) and f not in ADAPTER_FILES:
@@ -468,22 +419,21 @@ def repair(payload):
     train_valid = (
         isinstance(train_ids, list)
         and len(train_ids) > 0
-        and all(isinstance(x, str) and x != "" for x in train_ids)
+        and all(isinstance(x, str) and x for x in train_ids)
         and len(set(train_ids)) == len(train_ids)
     )
 
     eval_valid = (
         isinstance(eval_ids, list)
         and len(eval_ids) > 0
-        and all(isinstance(x, str) and x != "" for x in eval_ids)
+        and all(isinstance(x, str) and x for x in eval_ids)
         and len(set(eval_ids)) == len(eval_ids)
     )
 
-    if train_valid and eval_valid:
-        train_set = set(train_ids)
-        eval_set = set(eval_ids)
+    eval_isolated = False
 
-        if train_set.isdisjoint(eval_set):
+    if train_valid and eval_valid:
+        if set(train_ids).isdisjoint(set(eval_ids)):
             eval_isolated = True
         else:
             reason.add("EVAL_LEAKAGE")
@@ -519,7 +469,6 @@ def repair(payload):
     config = payload.get("configDigest")
     expected = payload.get("expectedDigests")
 
-    # Base revision must be an immutable 40-character lowercase Git SHA.
     base_valid = (
         isinstance(base, str)
         and HEX40.fullmatch(base) is not None
@@ -528,7 +477,6 @@ def repair(payload):
     if not base_valid:
         reason.add("MUTABLE_BASE_REVISION")
 
-    # All three lineage digests must be valid SHA-256 hex strings.
     digest_valid = (
         isinstance(dataset, str)
         and HEX64.fullmatch(dataset) is not None
@@ -579,11 +527,10 @@ def repair(payload):
 
     if batch_valid:
         if mb <= MAX_SAFE_INT // ga:
-            mb_ga = mb * ga
+            partial = mb * ga
 
-            if mb_ga <= MAX_SAFE_INT // replicas:
-                effective_batch = mb_ga * replicas
-                batch_pass = effective_batch == expected_batch
+            if partial <= MAX_SAFE_INT // replicas:
+                batch_pass = partial * replicas == expected_batch
 
     if not batch_pass:
         reason.add("EFFECTIVE_BATCH_MISMATCH")
