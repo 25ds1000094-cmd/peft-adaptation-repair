@@ -3,7 +3,12 @@ from fastapi.responses import JSONResponse
 import math
 import re
 
-app = FastAPI()
+app = FastAPI(
+    title="PEFT Adaptation and Repair API",
+    openapi_url="/openapi.json",
+    docs_url="/docs",
+    redoc_url="/redoc",
+)
 
 INTERVENTIONS = [
     "prompt_only",
