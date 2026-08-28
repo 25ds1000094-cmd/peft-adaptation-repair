@@ -219,7 +219,10 @@ def choose(payload):
         if cost > float(max_cost):
             r.add("COST_LIMIT")
 
-        reasons[name] = sorted(r, key=lambda x: x.encode("utf-8"))
+        reasons[name] = sorted(
+            r,
+            key=lambda x: x.encode("utf-8"),
+        )
 
         if not r:
             eligible.append(name)
@@ -288,6 +291,7 @@ def repair(payload):
     allowed = payload.get("allowedTargets")
 
     parameters_valid = isinstance(parameters, list)
+
     allowed_valid = (
         isinstance(allowed, list)
         and len(allowed) > 0
@@ -306,22 +310,63 @@ def repair(payload):
             name = p.get("name")
             target = p.get("target")
             numel = p.get("numel")
+            shape = p.get("shape")
 
+            # Parameter name
             if not isinstance(name, str) or not name:
                 parameters_valid = False
                 break
 
+            # Parameter names must be unique
             if name in names:
                 parameters_valid = False
                 break
 
             names.add(name)
 
+            # Target must be a non-empty string
             if not isinstance(target, str) or not target:
                 parameters_valid = False
                 break
 
+            # numel must be a positive safe integer
             if not positive_safe_int(numel):
+                parameters_valid = False
+                break
+
+            # Shape must be a non-empty list of positive safe integers
+            if (
+                not isinstance(shape, list)
+                or len(shape) == 0
+                or not all(positive_safe_int(dim) for dim in shape)
+            ):
+                parameters_valid = False
+                break
+
+            # numel must equal product(shape), with overflow protection
+            shape_numel = 1
+
+            for dim in shape:
+                if shape_numel > MAX_SAFE_INT // dim:
+                    parameters_valid = False
+                    break
+
+                shape_numel *= dim
+
+            if not parameters_valid:
+                break
+
+            if shape_numel != numel:
+                parameters_valid = False
+                break
+
+            # Every parameter must be a LoRA A/B weight.
+            is_lora_parameter = (
+                name.endswith(".lora_A.weight")
+                or name.endswith(".lora_B.weight")
+            )
+
+            if not is_lora_parameter:
                 parameters_valid = False
                 break
 
@@ -331,13 +376,7 @@ def repair(payload):
         allowed_set = set(allowed)
 
         for p in parameters:
-            if (
-                p["target"] in allowed_set
-                and (
-                    p["name"].endswith(".lora_A.weight")
-                    or p["name"].endswith(".lora_B.weight")
-                )
-            ):
+            if p["target"] in allowed_set:
                 selected.append(p)
 
         if not selected:
@@ -348,15 +387,26 @@ def repair(payload):
         trainable_params = []
         trainable_count = 0
         peft_pass = False
+
     else:
         trainable_params = sorted(
             [p["name"] for p in selected],
             key=lambda x: x.encode("utf-8"),
         )
 
-        trainable_count = sum(p["numel"] for p in selected)
+        # Safe summation of trainable parameter counts.
+        trainable_count = 0
 
-        if trainable_count > MAX_SAFE_INT:
+        for p in selected:
+            numel = p["numel"]
+
+            if trainable_count > MAX_SAFE_INT - numel:
+                parameters_valid = False
+                break
+
+            trainable_count += numel
+
+        if not parameters_valid:
             reason.add("INVALID_PARAMETER")
             trainable_params = []
             trainable_count = 0
@@ -373,11 +423,17 @@ def repair(payload):
 
     files = payload.get("artifactFiles")
 
+    expected_files = [
+        "adapter_config.json",
+        "adapter_model.safetensors",
+    ]
+
     adapter_valid = (
         isinstance(files, list)
-        and len(files) == 2
+        and len(files) == len(expected_files)
         and all(isinstance(x, str) for x in files)
-        and set(files) == ADAPTER_FILES
+        and len(set(files)) == len(files)
+        and set(files) == set(expected_files)
     )
 
     if adapter_valid:
@@ -391,7 +447,7 @@ def repair(payload):
 
     if isinstance(files, list):
         for f in files:
-            if isinstance(f, str) and f not in ADAPTER_FILES:
+            if isinstance(f, str) and f not in expected_files:
                 reason.add("FULL_MODEL_ARTIFACT")
 
     # ---------------- Evaluation isolation ----------------
@@ -425,7 +481,9 @@ def repair(payload):
 
     # ---------------- Evaluation determinism ----------------
 
-    evaluation_deterministic = payload.get("dropoutActiveDuringEval") is False
+    evaluation_deterministic = (
+        payload.get("dropoutActiveDuringEval") is False
+    )
 
     if not evaluation_deterministic:
         reason.add("EVAL_DROPOUT_ACTIVE")
@@ -507,7 +565,13 @@ def repair(payload):
     batch_pass = False
 
     if batch_valid:
-        batch_pass = mb * ga * replicas == expected_batch
+        # Avoid unsafe intermediate multiplication.
+        if mb <= MAX_SAFE_INT // ga:
+            mb_ga = mb * ga
+
+            if mb_ga <= MAX_SAFE_INT // replicas:
+                effective_batch = mb_ga * replicas
+                batch_pass = effective_batch == expected_batch
 
     if not batch_pass:
         reason.add("EFFECTIVE_BATCH_MISMATCH")
