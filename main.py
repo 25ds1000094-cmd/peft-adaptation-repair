@@ -91,7 +91,35 @@ def positive_safe_int(x):
 
 
 def utf8_sort(values):
-    return sorted(set(values), key=lambda x: x.encode("utf-8"))
+    return sorted(values, key=lambda x: x.encode("utf-8"))
+
+
+def valid_optional_shape(shape, numel):
+    """
+    Shape is optional because the API's original parameter schema only
+    requires name/target/numel.
+
+    If shape is supplied, however, it must be a non-empty list of positive
+    safe integers whose product exactly equals numel.
+    """
+    if shape is None:
+        return True
+
+    if (
+        not isinstance(shape, list)
+        or len(shape) == 0
+        or not all(positive_safe_int(dim) for dim in shape)
+    ):
+        return False
+
+    product = 1
+
+    for dim in shape:
+        if product > MAX_SAFE_INT // dim:
+            return False
+        product *= dim
+
+    return product == numel
 
 
 def choose(payload):
@@ -285,7 +313,7 @@ def repair(payload):
     if not template_pass:
         reason.add("CHAT_TEMPLATE_COUNT")
 
-    # ---------------- Parameters ----------------
+    # ---------------- Parameters / LoRA targets ----------------
 
     parameters = payload.get("parameters")
     allowed = payload.get("allowedTargets")
@@ -295,7 +323,7 @@ def repair(payload):
     allowed_valid = (
         isinstance(allowed, list)
         and len(allowed) > 0
-        and all(isinstance(x, str) and x for x in allowed)
+        and all(isinstance(x, str) and x != "" for x in allowed)
         and len(set(allowed)) == len(allowed)
     )
 
@@ -310,63 +338,29 @@ def repair(payload):
             name = p.get("name")
             target = p.get("target")
             numel = p.get("numel")
-            shape = p.get("shape")
 
-            # Parameter name
             if not isinstance(name, str) or not name:
                 parameters_valid = False
                 break
 
-            # Parameter names must be unique
             if name in names:
                 parameters_valid = False
                 break
 
             names.add(name)
 
-            # Target must be a non-empty string
             if not isinstance(target, str) or not target:
                 parameters_valid = False
                 break
 
-            # numel must be a positive safe integer
             if not positive_safe_int(numel):
                 parameters_valid = False
                 break
 
-            # Shape must be a non-empty list of positive safe integers
-            if (
-                not isinstance(shape, list)
-                or len(shape) == 0
-                or not all(positive_safe_int(dim) for dim in shape)
-            ):
-                parameters_valid = False
-                break
-
-            # numel must equal product(shape), with overflow protection
-            shape_numel = 1
-
-            for dim in shape:
-                if shape_numel > MAX_SAFE_INT // dim:
-                    parameters_valid = False
-                    break
-
-                shape_numel *= dim
-
-            if not parameters_valid:
-                break
-
-            if shape_numel != numel:
-                parameters_valid = False
-                break
-
-            # Every parameter must be a LoRA A/B weight.
-            is_lora_parameter = (
-                name.endswith(".lora_A.weight")
-                or name.endswith(".lora_B.weight")
-            )
-
-            if not is_lora_parameter:
+            # Shape is optional for backwards compatibility with the API
+            # schema. If present, it must be mathematically consistent with
+            # numel.
+            if not valid_optional_shape(p.get("shape"), numel):
                 parameters_valid = False
                 break
 
@@ -376,7 +370,18 @@ def repair(payload):
         allowed_set = set(allowed)
 
         for p in parameters:
-            if p["target"] in allowed_set:
+            name = p["name"]
+            target = p["target"]
+
+            # Non-LoRA parameters are allowed in the parameter list but are
+            # not trainable. Only LoRA A/B weights on an allowed target count.
+            if (
+                target in allowed_set
+                and (
+                    name.endswith(".lora_A.weight")
+                    or name.endswith(".lora_B.weight")
+                )
+            ):
                 selected.append(p)
 
         if not selected:
@@ -394,7 +399,8 @@ def repair(payload):
             key=lambda x: x.encode("utf-8"),
         )
 
-        # Safe summation of trainable parameter counts.
+        # Explicit safe accumulation instead of relying on an unbounded
+        # Python sum.
         trainable_count = 0
 
         for p in selected:
@@ -423,17 +429,19 @@ def repair(payload):
 
     files = payload.get("artifactFiles")
 
-    expected_files = [
-        "adapter_config.json",
-        "adapter_model.safetensors",
-    ]
-
+    # Exact adapter artifact set.
+    #
+    # The two expected files are:
+    #   adapter_config.json
+    #   adapter_model.safetensors
+    #
+    # Duplicates, missing files, and extra files all fail this check.
     adapter_valid = (
         isinstance(files, list)
-        and len(files) == len(expected_files)
+        and len(files) == len(ADAPTER_FILES)
         and all(isinstance(x, str) for x in files)
         and len(set(files)) == len(files)
-        and set(files) == set(expected_files)
+        and set(files) == ADAPTER_FILES
     )
 
     if adapter_valid:
@@ -445,9 +453,11 @@ def repair(payload):
         adapter_files = []
         reason.add("ADAPTER_FILE_SET")
 
+    # An explicit extra artifact indicates that a full-model artifact was
+    # supplied alongside/under the adapter artifact list.
     if isinstance(files, list):
         for f in files:
-            if isinstance(f, str) and f not in expected_files:
+            if isinstance(f, str) and f not in ADAPTER_FILES:
                 reason.add("FULL_MODEL_ARTIFACT")
 
     # ---------------- Evaluation isolation ----------------
@@ -458,21 +468,22 @@ def repair(payload):
     train_valid = (
         isinstance(train_ids, list)
         and len(train_ids) > 0
-        and all(isinstance(x, str) and x for x in train_ids)
+        and all(isinstance(x, str) and x != "" for x in train_ids)
         and len(set(train_ids)) == len(train_ids)
     )
 
     eval_valid = (
         isinstance(eval_ids, list)
         and len(eval_ids) > 0
-        and all(isinstance(x, str) and x for x in eval_ids)
+        and all(isinstance(x, str) and x != "" for x in eval_ids)
         and len(set(eval_ids)) == len(eval_ids)
     )
 
-    eval_isolated = False
-
     if train_valid and eval_valid:
-        if set(train_ids).isdisjoint(set(eval_ids)):
+        train_set = set(train_ids)
+        eval_set = set(eval_ids)
+
+        if train_set.isdisjoint(eval_set):
             eval_isolated = True
         else:
             reason.add("EVAL_LEAKAGE")
@@ -508,6 +519,7 @@ def repair(payload):
     config = payload.get("configDigest")
     expected = payload.get("expectedDigests")
 
+    # Base revision must be an immutable 40-character lowercase Git SHA.
     base_valid = (
         isinstance(base, str)
         and HEX40.fullmatch(base) is not None
@@ -516,6 +528,7 @@ def repair(payload):
     if not base_valid:
         reason.add("MUTABLE_BASE_REVISION")
 
+    # All three lineage digests must be valid SHA-256 hex strings.
     digest_valid = (
         isinstance(dataset, str)
         and HEX64.fullmatch(dataset) is not None
@@ -565,7 +578,6 @@ def repair(payload):
     batch_pass = False
 
     if batch_valid:
-        # Avoid unsafe intermediate multiplication.
         if mb <= MAX_SAFE_INT // ga:
             mb_ga = mb * ga
 
